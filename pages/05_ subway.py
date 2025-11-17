@@ -200,12 +200,3 @@ st.markdown("---")
 st.write("**Notes:** If you upload a different CSV, the app will attempt to detect encodings (utf-8 / cp949) and tab-separated formats. The app filters to October 2025 automatically if date column exists.")
 
 
-# ----------------------------
-# Requirements (save as requirements.txt)
-# ----------------------------
-# The content below should be saved into a separate file named `requirements.txt` when deploying.
-# requirements.txt
-# streamlit>=1.20
-# pandas>=1.5
-# plotly>=5.0
-
