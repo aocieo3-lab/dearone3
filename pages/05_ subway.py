@@ -1,34 +1,71 @@
-# streamlit_subway_plotly_app.py
-# Streamlit single-file app for exploring subway card data with Plotly
-# Save this file as `app.py` and deploy to Streamlit Cloud (or run locally with `streamlit run app.py`).
-
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
+# app.py
+import os
 from datetime import datetime
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Subway Top10 (Oct 2025)", layout="wide")
+st.set_page_config(page_title="Subway Top Stations (Oct 2025)", layout="wide")
 
-# ---------- Helpers ----------
-@st.cache_data
-def load_data(source_path=None, uploaded_file=None):
-    default_path = "/mnt/data/CARD_SUBWAY_MONTH_202510.csv"
-    source = uploaded_file if uploaded_file is not None else (source_path if source_path is not None else default_path)
+# ----------------- Helpers -----------------
+def try_read_csv(source):
+    """
+    Try multiple encodings and separators on source.
+    source can be a file path string or a file-like object (UploadedFile).
+    """
+    encodings = [None, "cp949", "utf-8"]
+    separators = [None, "\t", ","]
+    last_exc = None
+    for enc in encodings:
+        for sep in separators:
+            try:
+                if sep is None and enc is None:
+                    return pd.read_csv(source)
+                elif sep is None:
+                    return pd.read_csv(source, encoding=enc)
+                elif enc is None:
+                    return pd.read_csv(source, sep=sep)
+                else:
+                    return pd.read_csv(source, encoding=enc, sep=sep)
+            except Exception as e:
+                last_exc = e
+                # if source is file-like, reset pointer for next attempt
+                try:
+                    if hasattr(source, "seek"):
+                        source.seek(0)
+                except Exception:
+                    pass
+    raise last_exc
 
-    # Read with common encodings / separators
-    try:
-        df = pd.read_csv(source)
-    except Exception:
+def load_data_safe(default_path="/mnt/data/CARD_SUBWAY_MONTH_202510.csv", uploaded_file=None):
+    """
+    Read CSV from uploaded_file (preferred) or default_path.
+    Returns dataframe or raises Exception with helpful message.
+    """
+    # 1) uploaded file branch (do not cache this branch)
+    if uploaded_file is not None:
         try:
-            df = pd.read_csv(source, encoding="cp949")
-        except Exception:
-            df = pd.read_csv(source, encoding="cp949", sep="\t")
+            df = try_read_csv(uploaded_file)
+        except Exception as e:
+            raise RuntimeError(f"업로드한 파일을 파싱하지 못했습니다. 오류: {e}") from e
+        return df
 
-    # Normalize column names
-    df.columns = [c.strip() for c in df.columns.astype(str)]
+    # 2) server file branch
+    if not os.path.exists(default_path):
+        raise FileNotFoundError(f"서버 기본 파일을 찾을 수 없습니다: {default_path}.\n사이드바에서 파일을 업로드하거나 경로를 확인하세요.")
+    try:
+        df = try_read_csv(default_path)
+    except Exception as e:
+        raise RuntimeError(f"서버 CSV 파일을 읽는 중 오류 발생: {e}") from e
 
-    # If single-column with tabs inside, split
+    return df
+
+# Column cleanup & type conversion
+def normalize_df(df):
+    # strip column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # If file was a single column with tabs inside, split into columns
     if len(df.columns) == 1 and "\t" in df.columns[0]:
         df = df.iloc[:,0].str.split("\t", expand=True)
         df.columns = df.iloc[0]
@@ -52,7 +89,6 @@ def load_data(source_path=None, uploaded_file=None):
     # Convert types
     if "date" in df.columns:
         df["date"] = df["date"].astype(str)
-        # Try YYYYMMDD
         try:
             df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
         except Exception:
@@ -62,7 +98,6 @@ def load_data(source_path=None, uploaded_file=None):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).astype(int)
 
-    # Ensure station and line are strings
     if "station" in df.columns:
         df["station"] = df["station"].astype(str)
     if "line" in df.columns:
@@ -70,18 +105,18 @@ def load_data(source_path=None, uploaded_file=None):
 
     return df
 
-
+# Color utilities
 def hex_to_rgb(hex_color: str):
     hex_color = hex_color.lstrip('#')
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-
 def rgb_to_hex(rgb):
     return '#%02x%02x%02x' % rgb
 
-
 def generate_gray_gradient(n, start_hex="#2f2f2f", end_hex="#bfbfbf"):
-    """Return list of `n` hex colors from start_hex to end_hex (inclusive)."""
+    """
+    Return list of n hex colors from start_hex to end_hex inclusive.
+    """
     if n <= 0:
         return []
     start_rgb = hex_to_rgb(start_hex)
@@ -97,106 +132,104 @@ def generate_gray_gradient(n, start_hex="#2f2f2f", end_hex="#bfbfbf"):
         colors.append(rgb_to_hex(rgb))
     return colors
 
-
-# ---------- Sidebar / Inputs ----------
-st.sidebar.title("Data & Options")
-uploaded_file = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv", "txt"]) 
-use_default = st.sidebar.checkbox("Use default server file (Oct 2025)", value=True)
+# ----------------- Sidebar UI -----------------
+st.sidebar.title("데이터 및 옵션")
+uploaded_file = st.sidebar.file_uploader("CSV 업로드 (선택)", type=["csv", "txt"])
+use_server_file = st.sidebar.checkbox("서버 기본 파일 사용 (Oct 2025)", value=True)
 
 st.sidebar.markdown("---")
-# We'll load data then let user pick an actual date from available dates
+st.sidebar.write("날짜(2025-10 중 하루)와 호선을 골라 Top N 역을 표시합니다.")
+st.sidebar.markdown("그래프 색: 1등 검정, 나머지는 어두운 회색→연한 회색 그라데이션.")
 
-# ---------- Load data ----------
-with st.spinner("Loading data..."):
-    df = load_data(source_path=(None if uploaded_file is not None else "/mnt/data/CARD_SUBWAY_MONTH_202510.csv"), uploaded_file=uploaded_file)
-
-if df is None or df.empty:
-    st.error("데이터를 불러오지 못했습니다. 파일을 업로드하거나 서버의 기본 파일 경로를 확인하세요.")
+# ----------------- Load & normalize data -----------------
+try:
+    df_raw = load_data_safe(default_path="/mnt/data/CARD_SUBWAY_MONTH_202510.csv", uploaded_file=uploaded_file if uploaded_file is not None else None)
+except Exception as e:
+    st.error(str(e))
     st.stop()
 
-# Filter to October 2025 if dates exist
+df = normalize_df(df_raw)
+
+if df.empty:
+    st.error("데이터가 비어있습니다.")
+    st.stop()
+
+# Filter to Oct 2025 if date exists
 if "date" in df.columns:
     df = df[df["date"].dt.year == 2025]
     df = df[df["date"].dt.month == 10]
 
-# Date selection: choose one day from available dates
-available_dates = sorted(df["date"].dt.date.unique()) if "date" in df.columns else []
-selected_date = st.sidebar.selectbox("Select date (2025-10)", options=available_dates, index=0 if available_dates else None)
-
-# Line selection
-available_lines = sorted(df["line"].unique()) if "line" in df.columns else []
-selected_line = st.sidebar.selectbox("Select line", options=available_lines, index=0 if available_lines else None)
-
-# Top N
-top_n = st.sidebar.slider("Top N stations", min_value=5, max_value=50, value=10)
-
-st.sidebar.markdown("---")
-st.sidebar.write("App: Select a date in October 2025 and a subway line to show top stations by (승차+하차).\nGraph colors: 1st = black, others = dark gray → lighter gray gradient.")
-
-# ---------- Main ----------
-st.title("Top 10 Stations — Selected Date & Line (Oct 2025)")
-st.markdown("날짜와 호선을 선택하면, 승차+하차 합이 큰 상위 10개 역을 막대그래프로 표시합니다.")
-
-if selected_date is None or selected_line is None:
-    st.info("날짜와 호선을 선택해주세요.")
+# available dates and lines
+if "date" not in df.columns or df["date"].isna().all():
+    st.error("날짜(date) 컬럼이 없거나 파싱에 실패했습니다.")
     st.stop()
 
-# Filter df
+available_dates = sorted(df["date"].dt.date.unique())
+selected_date = st.sidebar.selectbox("날짜 선택 (2025-10)", options=available_dates, index=0)
+
+available_lines = sorted(df["line"].unique()) if "line" in df.columns else []
+if not available_lines:
+    st.error("노선(line) 컬럼이 없습니다.")
+    st.stop()
+
+selected_line = st.sidebar.selectbox("호선 선택", options=available_lines, index=0)
+top_n = st.sidebar.slider("Top N 역", min_value=5, max_value=50, value=10)
+
+# ----------------- Main panel -----------------
+st.title("Top Stations — 승차+하차 합 (2025년 10월)")
+st.write(f"선택한 날짜: **{selected_date}**, 선택한 호선: **{selected_line}**")
+
+# filter for selected date & line
 mask = (df["date"].dt.date == pd.to_datetime(selected_date).date()) & (df["line"] == selected_line)
 df_sel = df[mask].copy()
 
 if df_sel.empty:
-    st.warning("선택한 날짜와 호선에 해당하는 데이터가 없습니다.")
+    st.warning("선택한 날짜와 호선의 데이터가 없습니다.")
     st.stop()
 
-# Compute total passengers per station
+# compute total
 if "on" in df_sel.columns and "off" in df_sel.columns:
     df_sel["total"] = df_sel["on"] + df_sel["off"]
 else:
-    st.error("데이터에 승차(on) 또는 하차(off) 컬럼이 없습니다.")
+    st.error("승차(on) 또는 하차(off) 컬럼이 없습니다.")
     st.stop()
 
 agg = df_sel.groupby("station").agg(total=("total", "sum")).reset_index().sort_values("total", ascending=False)
 agg_top = agg.head(top_n).reset_index(drop=True)
 
-# Prepare colors: first black, others gradient from dark gray to lighter gray (length top_n-1)
+# prepare colors
 colors = []
-if agg_top.shape[0] > 0:
-    colors.append('#000000')  # first is black
-    remaining = max(0, agg_top.shape[0] - 1)
+if len(agg_top) > 0:
+    colors.append("#000000")  # 1st black
+    remaining = max(0, len(agg_top) - 1)
     if remaining > 0:
         grad = generate_gray_gradient(remaining, start_hex="#2f2f2f", end_hex="#bfbfbf")
         colors.extend(grad)
 
-# Create Plotly bar chart with custom colors
+# plotly bar
 fig = go.Figure()
 fig.add_trace(go.Bar(
-    x=agg_top['station'],
-    y=agg_top['total'],
+    x=agg_top["station"],
+    y=agg_top["total"],
     marker_color=colors,
-    text=agg_top['total'],
-    textposition='auto',
-    hovertemplate='<b>%{x}</b><br>Total: %{y}<extra></extra>'
+    text=agg_top["total"],
+    textposition="auto",
+    hovertemplate="<b>%{x}</b><br>Total: %{y}<extra></extra>"
 ))
 fig.update_layout(
-    title=f"Top {agg_top.shape[0]} stations on {selected_line} — {selected_date}",
+    title=f"Top {len(agg_top)} stations — {selected_line} ({selected_date})",
     xaxis_title="Station",
     yaxis_title="Total passengers (승차+하차)",
     xaxis_tickangle=-45,
     margin=dict(l=40, r=20, t=80, b=160),
-    plot_bgcolor='white'
+    plot_bgcolor="white"
 )
-
-# Make bars visually separated and slightly rounded via marker
-fig.update_traces(marker_line_color='rgba(0,0,0,0.2)', marker_line_width=1)
+fig.update_traces(marker_line_color="rgba(0,0,0,0.2)", marker_line_width=1)
 
 st.plotly_chart(fig, use_container_width=True)
 
-# Show table below
-st.subheader("Top stations table")
+st.subheader("상세 표 (Top stations)")
 st.dataframe(agg_top)
 
 st.markdown("---")
-st.write("**Notes:** If you upload a different CSV, the app will attempt to detect encodings (utf-8 / cp949) and tab-separated formats. The app filters to October 2025 automatically if date column exists.")
-
-
+st.write("Tip: 다른 CSV를 업로드하면 해당 파일로 분석합니다. (인코딩 utf-8 / cp949 / TSV 자동 시도)")
